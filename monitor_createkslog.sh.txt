@@ -1,0 +1,29 @@
+#!/bin/bash
+
+DATE=$(date +"%m-%d-%Y %T")
+VALUE=40000
+RMQUSERNAME=<RABBITMQUSERNAME>
+RMQPASSWD=<RABBITMQPASSWORD>
+SUCCESS="queue purged"
+
+
+COUNT=`rabbitmqadmin -Vbots -u$RMQUSERNAME -p$RMQPASSWD list queues |grep -i 'create_kslog' | awk '{ $1="";print}' | awk '{ $4="";print}' | awk '{print $3}'`
+
+echo -e "Server DATE:: $DATE \n================================= \n\n RMQ Queue \"create_kslog\" is:: $COUNT \n" > /data/scripts/CREATE_KS_LOG_STATUS
+
+
+if [ $VALUE -gt $COUNT ]
+        then
+                echo "Total Count is acceptable: $COUNT"
+        else
+        		echo "Total Count is unacceptable: $COUNT.Purging the queue create_kslog"
+                COMMAND_STATUS=`rabbitmqadmin -Vbots -u$RMQUSERNAME -p$RMQPASSWD purge queue name=create_kslog`
+                
+                if [ "$COMMAND_STATUS" = "$SUCCESS" ]
+	                then
+	                	echo -e "Server DATE:: $DATE \n================================= \n\n RMQ Queue \"create_kslog\" purge success \n" >> /data/scripts/CREATE_KS_LOG_STATUS
+	                else
+	                	echo -e "Server DATE:: $DATE \n================================= \n\n RMQ Queue \"create_kslog\" purge failed with \"$COMMAND_STATUS\" \n" >> /data/scripts/CREATE_KS_LOG_STATUS
+                                exit 1
+                fi
+fi
