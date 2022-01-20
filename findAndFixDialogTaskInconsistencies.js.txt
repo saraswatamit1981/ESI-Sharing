@@ -1,0 +1,246 @@
+/**
+ * This script checks if there are Dialog Nodes in Dialog which don't have refernce to Dialog Components. If any such nodes are found, the script tries
+ * to add those missing references by checking the published version of the Dialog.
+ * 
+ * INSTRUCTIONS:
+ *      mongo fixMissingDialogComps.js --eval "botId='', mode='';" 
+ *              botId -> Provide the BOT-ID as a string.
+ *              mode  -> Provide the execution mode of the script as a string. NOTE: mode can be either 'VIEW' or 'UPDATE'
+ *
+ * EXAMPLES:
+ *      mongo findAndFixDialogTaskInconsistencies.js --eval "botIds=['st-8152e4ae-bec1-5103-9419-39a716a510f1']; mode='VIEW';"
+ * 
+
+ */
+var dbt = db.getSiblingDB('koredbt001');
+var dbm = db.getSiblingDB('koredbm001');
+var mode, default_mode = 'view';
+
+function getPublishedDialog(dialogRefId, streamId, publishedDialogs) {
+    if (dialogRefId in publishedDialogs) {
+        return publishedDialogs[dialogRefId];
+    }
+    var query = {
+        streamId: streamId,
+        refId: dialogRefId,
+        state: {
+            $in: ['published', 'suspended']
+        }
+    };
+    var projection = { 'nodes.nodeId': 1, 'nodes.componentId': 1 };
+    var publishedDialog = dbt.dialogtasks.findOne(query, projection);
+    if (!publishedDialog) {
+        throw new Error('Published Dialog not found!');
+    }
+    publishedDialogs[dialogRefId] = publishedDialog;
+    return publishedDialog;
+}
+
+function getConfiguredCompId(publishedCompId, streamId) {
+    var publishedComp = dbt.dialogcomponents.findOne({ streamId: streamId, _id: publishedCompId });
+    if (!publishedComp) {
+        throw new Error('Published Component not found!');
+    }
+    var query = {
+        streamId: streamId,
+        refId: publishedComp.refId,
+        status: {
+            $in: ['configured', 'awaitingApproval', 'rejected']
+        }
+    };
+    var configuredComp = dbt.dialogcomponents.findOne(query, { _id: 1 });
+    if (!configuredComp) {
+        throw new Error('Configured Component not found!');
+    }
+    return configuredComp._id;
+}
+
+function fixMissingComponentIdInDialogNodes(streamIds) {
+    for(var i = 0; i < streamIds.length; i++) {
+        var streamId = streamIds[i];
+        print(` ============ CHECKING FOR MISSING DCID IN DIALOG NODES ${streamId} ============ `);
+        var total_inconsistencies = 0, fixed_inconsistencies = 0;
+        var publishedDialogs = {};
+        var query = {
+            streamId: streamId,
+            state: {
+                $in: ['configured', 'awaitingApproval', 'rejected']
+            }
+        };
+        var projection = {
+            lname: 1,
+            state: 1,
+            'nodes.nodeId': 1,
+            'nodes.componentId': 1,
+            refId: 1
+        };
+        var crsr = dbt.dialogtasks.find(query, projection).noCursorTimeout();
+    
+        while (crsr.hasNext()) {
+            var dialog = crsr.next();
+            print('\nIn Dialog "' + dialog.lname + '" (' + dialog.state + '):');
+            dialog.nodes.forEach(function (node) {
+                if (!node.componentId) {
+                    total_inconsistencies++;
+                    try {
+                        var publishedDialog = getPublishedDialog(dialog.refId, streamId, publishedDialogs);
+                        var publishedNode = publishedDialog.nodes.find(function (_publishedNode) { return _publishedNode.nodeId === node.nodeId; });
+                        if (!publishedNode) {
+                            throw new Error('Corresponding Dialog Node not found in the Published Dialog!');
+                        }
+                        var publishedCompId = publishedNode.componentId;
+                        var configuredCompId = getConfiguredCompId(publishedCompId, streamId);
+                        if (mode === 'update') {
+                            var res = dbt.dialogtasks.update({ _id: dialog._id, 'nodes.nodeId': node.nodeId }, { $set: { 'nodes.$.componentId': configuredCompId } });
+                            print('\tFixed reference to component!', JSON.stringify(res));
+                            fixed_inconsistencies++;
+                        }
+                        else {
+                            print('\tMissing component found!', JSON.stringify(node));
+                        }
+                    }
+                    catch (err) {
+                        print('\tError while checking/fixing node =>', err.message);
+                    }
+                }
+            });
+            print(" === TOTAL INCONSISTENCIES FOUND === ", total_inconsistencies);
+            if(mode === "update") print(" === FIXED INCONSISTENCIES === ", fixed_inconsistencies);
+            print(" ============ DONE ============ ");
+        }
+    }
+}
+
+function findDuplicatesIntheBot(botId){
+    return dbt.dialogcomponents.aggregate([ 
+        // {$match:{streamId:botId, type:"intent"}}, 
+        {$match:{streamId:botId}}, 
+        {$group:{_id:{"refId":"$refId", status:"$status"}, cnt:{$sum:1}, recs:{$push:{name:"$name", status:"$status", type:"$type", _id:"$_id", dialogId:"$dialogId"}}}}, 
+        {$match:{cnt:{$gt:1}}}
+    ], { allowDiskUse: true });    
+}
+
+function getUsage(componentId){
+    return dbt.dialogtasks.count({"nodes.componentId":componentId});
+}
+
+function fixBotsWithDuplicateComponentIds(botIds) {
+    botIds.map(function(botId){
+        var bot = dbm.btstreams.findOne({_id:botId});
+        if(!bot){
+            print("Bot not found for the id " + botId);
+            return;
+        }
+        var lang = bot.defaultLanguage || "en";
+        print(` ============ CHECKING FOR DUPLICATE COMP IDS ${botId} ============ `);
+        var cursor = findDuplicatesIntheBot(botId);
+        while(cursor.hasNext()){
+            var doc = cursor.next();
+            print('\n---------------------------' + doc._id.refId + '--------------------------------------\n');  
+            doc.recs.map(function(comp){
+                var usage = getUsage(comp._id);
+                var prefix = "Used    ====> ";
+                var suffix = "";
+                
+                if(usage == 0){
+                    prefix = "Un-used ====> ";
+                    suffix = " Will be deleted";                
+                } 
+                print( prefix + comp.type + " - " + comp._id + " - " + comp.name + ' - ' + comp.status + ' - ' +  " ==> " + usage + suffix);
+                if(mode === "update" && usage === 0){
+                    var res = dbt.dialogcomponents.remove( { _id: comp._id } );
+                    print("Removed: " + comp._id + JSON.stringify(res));
+                }
+            });        
+        }
+        print(" ============ DONE ============ ")
+    });
+}
+
+function fixLinkedDialogInconsistencies(streamIds) {
+    for (var i = 0; i < streamIds.length; i++) {
+        print(` ============ CHECKING FOR FLOWTASK INCONSISTENCY ${streamIds[i]} ============ `);
+        var query = { streamId: streamIds[i] };
+        var tasksCursor = dbt.dialogtasks.find(query).noCursorTimeout();
+        while (tasksCursor.hasNext()) {
+            var task = tasksCursor.next();
+            if (task.nodes && task.nodes.length) {
+                //print(JSON.stringify(task.nodes), task._id, task.name);
+                var componentId = task.nodes[0].componentId;
+                var dialogComponent = dbt.dialogcomponents.findOne({ _id: componentId });
+                if (dialogComponent) {
+                    var dialogTask = dbt.dialogtasks.findOne({ _id: dialogComponent.dialogId, streamId: streamIds[i]});
+                    if (mode === "view") {
+                        if (!dialogComponent.dialogId) {
+                            print(`Component ${dialogComponent.lname} in ${streamIds[i]} has dialogId with null value`);
+                        }
+                        else if(dialogTask && dialogTask.state !== dialogComponent.status){
+                            print(`Component ${dialogComponent.lname} in ${streamIds[i]} has incorrect state dialogId reference`);
+                        }
+                        else if(!dialogTask){
+                            print(`Component ${dialogComponent.lname} in ${streamIds[i]} has incorrect dialogId reference`);
+                        }
+                    } else {
+                        print(`Fixing the component ${dialogComponent.lname} in ${streamIds[i]}`);
+                        dbt.dialogcomponents.update({ _id: componentId, type: "intent" }, { $set: { dialogId: task._id } });
+                    }
+                }
+            }
+        }
+    
+        var tasksCursor = dbt.dialogtasks.find({ "streamId": streamIds[i], "nodes.flowTaskId": { $exists: 1 }, "sbTaskId": { $exists: 0 } }).noCursorTimeout();
+    
+        while (tasksCursor.hasNext()) {
+            var task = tasksCursor.next();
+            var toBeFixed = false;
+            var newNodes = [];
+            if (task.nodes && task.nodes.length) {
+                var nodes = task.nodes;
+                nodes.map(function (node) {
+                    if (node.flowTaskId && node.componentId) {
+                        var dc = dbt.dialogcomponents.findOne({ _id: node.componentId });
+                        if (dc && dc.dialogId) {
+                            var dt = dbt.dialogtasks.findOne({ _id: dc.dialogId });
+                            if (dt && dt.refId !== node.flowTaskId) {
+                                node.flowTaskId = dt.refId;
+                                toBeFixed = true;
+                            }
+                        }
+                    }
+                    newNodes.push(node);
+                })
+            }
+            if (toBeFixed) {
+                print(`DialogTask ${task.lname} : ${task._id} has INCONSISTENCY`);
+                if (mode === "update") {
+                    print("FIXING :" + task.lname + " - " + task._id + " - " + task.streamId);
+                    var res = dbt.dialogtasks.update({ _id: task._id }, { $set: { nodes: newNodes } });
+                    printjson(res);
+                }
+            }
+        }
+        print(`==============================================================================================`);
+    }
+}
+
+
+function run() {
+    if (!botIds) {
+        print('\nBOT-ID not provided!');
+        return;
+    }
+    if (!mode) {
+        mode = default_mode;
+    }
+    mode = mode.toLowerCase();
+    if (['view', 'update'].indexOf(mode) === -1) {
+        print('\nInvalid execution mode!');
+        return;
+    }
+    fixMissingComponentIdInDialogNodes(botIds);
+    fixBotsWithDuplicateComponentIds(botIds);
+    fixLinkedDialogInconsistencies(botIds);
+    print('Done!');
+}
+
+run();
